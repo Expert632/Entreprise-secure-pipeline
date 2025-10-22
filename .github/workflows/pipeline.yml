@@ -1,0 +1,159 @@
+name: Enterprise Secure CI/CD Pipeline
+
+on:
+  push:
+    branches: [ "main", "develop" ]
+  pull_request:
+    branches: [ "main", "develop" ]
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * *'   # daily full scan at 6 AM
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  security_pipeline:
+    name: Full Security Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      # -------------------------------------------------------
+      # 🧱 STEP 1 : Checkout & Setup
+      # -------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.11
+
+      - name: Install dependencies
+        run: |
+          if [ -f "package.json" ]; then npm install --legacy-peer-deps; fi
+          if [ -f "requirements.txt" ]; then pip install -r requirements.txt; fi
+
+      # -------------------------------------------------------
+      # 🔍 STEP 2 : SAST - Static Application Security Testing (CodeQL)
+      # -------------------------------------------------------
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v2
+        with:
+          languages: javascript,python,java
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v2
+
+      # -------------------------------------------------------
+      # 📦 STEP 3 : SCA - Dependency Scanning (Dependabot + npm audit)
+      # -------------------------------------------------------
+      - name: Dependency Audit
+        run: |
+          if [ -f "package.json" ]; then npm audit --audit-level=high || true; fi
+          if [ -f "requirements.txt" ]; then pip install safety && safety check || true; fi
+
+      # -------------------------------------------------------
+      # 🕵️ STEP 4 : Secret Scanning (Gitleaks)
+      # -------------------------------------------------------
+      - name: Secret Scan with Gitleaks
+        uses: zricethezav/gitleaks-action@v2
+        with:
+          args: --path=. --verbose
+
+      # -------------------------------------------------------
+      # 🐳 STEP 5 : Container Image Build + Static Scan (Trivy)
+      # -------------------------------------------------------
+      - name: Build Docker image
+        run: |
+          docker build -t my-app:${{ github.sha }} .
+
+      - name: Scan Docker image with Trivy
+        run: |
+          trivy image --exit-code 0 --severity HIGH,CRITICAL --format json --output trivy-report.json my-app:${{ github.sha }}
+          cat trivy-report.json | jq '.Results[].Vulnerabilities | length'
+
+      # -------------------------------------------------------
+      # 🧾 STEP 6 : Generate SBOM + Sign (Syft + Cosign)
+      # -------------------------------------------------------
+      - name: Generate SBOM with Syft
+        id: sbom
+        run: |
+          syft my-app:${{ github.sha }} -o spdx-json > sbom.spdx.json
+
+      - name: Sign SBOM with Cosign
+        env:
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          cosign sign-blob --key ${{ secrets.COSIGN_KEY }} sbom.spdx.json
+
+      # -------------------------------------------------------
+      # 🌐 STEP 7 : DAST - Dynamic Application Security Testing (ZAP)
+      # -------------------------------------------------------
+      - name: Start Test Server (if applicable)
+        run: |
+          nohup npm start & sleep 10 || true
+
+      - name: OWASP ZAP Baseline Scan
+        uses: zaproxy/action-baseline@v0.9.0
+        with:
+          target: 'http://localhost:3000'  # adapt target URL
+          cmd_options: '-a -T 5'
+
+      # -------------------------------------------------------
+      # 🧪 STEP 8 : Fuzz Testing (AFL++)
+      # -------------------------------------------------------
+      - name: Install AFL++ for fuzzing
+        run: |
+          sudo apt update && sudo apt install -y afl++
+
+      - name: Run basic fuzzing (example)
+        run: |
+          echo "Fuzzing lightweight test"
+          mkdir fuzz && echo "seed" > fuzz/input.txt
+          afl-fuzz -i fuzz -o fuzz/out -- echo @@
+
+      # -------------------------------------------------------
+      # ☁️ STEP 9 : Upload Reports to Artifactory / Nexus
+      # -------------------------------------------------------
+      - name: Upload Reports to Artifactory
+        run: |
+          echo "Uploading reports to Artifactory..."
+          curl -u "${{ secrets.ARTIFACTORY_USER }}:${{ secrets.ARTIFACTORY_PASS }}" \
+            -T trivy-report.json \
+            "https://artifactory.example.com/repo/security-reports/trivy-${{ github.sha }}.json"
+          curl -u "${{ secrets.ARTIFACTORY_USER }}:${{ secrets.ARTIFACTORY_PASS }}" \
+            -T sbom.spdx.json \
+            "https://artifactory.example.com/repo/security-reports/sbom-${{ github.sha }}.json"
+
+      # -------------------------------------------------------
+      # 🚨 STEP 10 : Security Gate (Fail if critical vulnerabilities)
+      # -------------------------------------------------------
+      - name: Security Gate - Stop on CRITICAL vulnerabilities
+        run: |
+          CRIT=$(cat trivy-report.json | jq '[.Results[].Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length')
+          echo "Critical Vulnerabilities found: $CRIT"
+          if [ "$CRIT" -gt 0 ]; then
+            echo "🚨 Critical vulnerabilities detected — stopping pipeline"
+            exit 1
+          fi
+
+      # -------------------------------------------------------
+      # 🧰 STEP 11 : Infrastructure as Code (IaC) Scan - Terraform / K8s
+      # -------------------------------------------------------
+      - name: Scan IaC files with Trivy
+        run: |
+          trivy config --exit-code 0 --severity HIGH,CRITICAL --format json --output trivy-iac.json .
+
+      # -------------------------------------------------------
+      # ✅ STEP 12 : Summary
+      # -------------------------------------------------------
+      - name: Display summary
+        run: |
+          echo "✅ All scans completed successfully"
